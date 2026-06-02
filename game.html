@@ -143,6 +143,7 @@
     <b>2 gomb:</b> Csákány elővétele (ha van)<br>
     <b>B gomb:</b> Építés KI / BE<br>
     <b>Bal Klikk:</b> Használat / Építés<br>
+    <b>Jobb Klikk:</b> Bogyó leszedése bokorról<br>
     <b>0 gomb:</b> UI elrejtése
 </div>
 
@@ -615,7 +616,7 @@ while (spawnedTrees < maxTrees) {
     let rz = (Math.random() - 0.5) * spawnRadius * 2;
     let ry = getTerrainHeight(rx, rz);
     
-    if (ry > -1.1) {
+    if (ry > -1.1 && Math.hypot(rx, rz) > 6) {
         const treeMesh = createTreeMesh();
         treeMesh.position.set(rx, ry - TREE_GROUND_OFFSET, rz);
         surfaceGroup.add(treeMesh);
@@ -703,6 +704,10 @@ window.addEventListener('mousemove', (e) => {
     }
 });
 
+window.addEventListener('contextmenu', (e) => {
+    e.preventDefault();
+});
+
 function damageTreeById(id) {
     const tree = trees.find(t => t.id === id);
     if (tree) {
@@ -760,7 +765,15 @@ function useCurrentTool() {
 }
 
 window.addEventListener('mousedown', (e) => {
-    if (e.button === 0 && document.pointerLockElement === document.body) { 
+    if (document.pointerLockElement !== document.body) return;
+
+    // Jobb klikk: bogyó leszedése bokorról. A bokor megmarad.
+    if (e.button === 2) {
+        pickBerryFromBush();
+        return;
+    }
+
+    if (e.button === 0) { 
         if (currentMode === "build") {
             if (woodAmount >= 10) {
                 spawnWall(blueprint.position.x, blueprint.position.y, blueprint.position.z, blueprint.rotation.y);
@@ -804,27 +817,70 @@ window.addEventListener('keydown', (e) => {
 });
 window.addEventListener('keyup', (e) => { keys[e.key.toLowerCase()] = false; });
 
-function checkCollision(targetX, targetZ) {
-    const playerRadius = 0.2;
-    const wallLength = 4.0, wallWidth = 0.7; 
+function checkCollision(targetX, targetZ, currentX = camera.position.x, currentZ = camera.position.z) {
+    const playerRadius = 0.35;
+
+    // Fal hitbox: forgatott téglalap, stabilabb sarokkezeléssel.
+    // Ha valaki véletlenül beleragad, kifelé engedjük mozogni.
+    const wallLength = 4.0;
+    const wallWidth = 0.75;
+
     for (let i = 0; i < placedWalls.length; i++) {
         const wall = placedWalls[i];
         if (wall.dim !== currentDimension) continue;
-        const dx = targetX - wall.x, dz = targetZ - wall.z;
-        const cos = Math.cos(-wall.rotation), sin = Math.sin(-wall.rotation);
-        const localX = dx * cos - dz * sin, localZ = dx * sin + dz * cos;
-        if (Math.abs(localX) < (wallLength / 2 + playerRadius) && Math.abs(localZ) < (wallWidth / 2 + playerRadius)) return true; 
+
+        const cos = Math.cos(-wall.rotation);
+        const sin = Math.sin(-wall.rotation);
+
+        const currentDx = currentX - wall.x;
+        const currentDz = currentZ - wall.z;
+        const targetDx = targetX - wall.x;
+        const targetDz = targetZ - wall.z;
+
+        const currentLocalX = currentDx * cos - currentDz * sin;
+        const currentLocalZ = currentDx * sin + currentDz * cos;
+        const targetLocalX = targetDx * cos - targetDz * sin;
+        const targetLocalZ = targetDx * sin + targetDz * cos;
+
+        const halfL = wallLength / 2 + playerRadius;
+        const halfW = wallWidth / 2 + playerRadius;
+
+        const currentInside =
+            Math.abs(currentLocalX) < halfL &&
+            Math.abs(currentLocalZ) < halfW;
+
+        const targetInside =
+            Math.abs(targetLocalX) < halfL &&
+            Math.abs(targetLocalZ) < halfW;
+
+        const currentEscapeScore =
+            Math.max(Math.abs(currentLocalX) / halfL, Math.abs(currentLocalZ) / halfW);
+        const targetEscapeScore =
+            Math.max(Math.abs(targetLocalX) / halfL, Math.abs(targetLocalZ) / halfW);
+
+        if (targetInside) {
+            // Ha már bent vagy a hitboxban, csak azt blokkoljuk, ha még mélyebbre mennél.
+            if (currentInside && targetEscapeScore > currentEscapeScore) {
+                continue;
+            }
+            return true;
+        }
     }
-    
+
     // Fákkal ütközés: minden fa, ami a trees listában van, hitboxot kap.
     // A kivágott fákon át lehet menni.
     if (currentDimension === "surface") {
-        const treeRadius = 1.6;
+        const treeRadius = 1.0;
         for (let i = 0; i < trees.length; i++) {
             const tree = trees[i];
             if (!tree.mesh.visible || tree.health <= 0) continue;
             const p = tree.mesh.position;
-            if (Math.hypot(targetX - p.x, targetZ - p.z) < treeRadius) return true;
+
+            const currentDist = Math.hypot(currentX - p.x, currentZ - p.z);
+            const targetDist = Math.hypot(targetX - p.x, targetZ - p.z);
+
+            // Ha véletlenül fa közelében spawnolsz, akkor engedjük, hogy kifelé mozogj.
+            if (targetDist < treeRadius && targetDist <= currentDist) return true;
         }
     }
 
@@ -869,9 +925,9 @@ function updateMovement() {
     if (keys['d']) moveVector.addScaledVector(right, moveSpeed);
 
     let nextX = camera.position.x + moveVector.x;
-    if (!checkCollision(nextX, camera.position.z)) camera.position.x = nextX;
+    if (!checkCollision(nextX, camera.position.z, camera.position.x, camera.position.z)) camera.position.x = nextX;
     let nextZ = camera.position.z + moveVector.z;
-    if (!checkCollision(camera.position.x, nextZ)) camera.position.z = nextZ;
+    if (!checkCollision(camera.position.x, nextZ, camera.position.x, camera.position.z)) camera.position.z = nextZ;
     
     if (currentDimension === "surface") {
         let currentH = getTerrainHeight(camera.position.x, camera.position.z);
@@ -961,8 +1017,7 @@ function updateChunks() {
         const cz = Math.floor(b.position.z / CHUNK_SIZE);
         b.visible =
             Math.abs(cx - playerChunkX) <= ACTIVE_RADIUS &&
-            Math.abs(cz - playerChunkZ) <= ACTIVE_RADIUS &&
-            !b.userData.harvested;
+            Math.abs(cz - playerChunkZ) <= ACTIVE_RADIUS;
     });
 }
 
@@ -974,7 +1029,7 @@ function optimizeWorldRendering() {
     });
 
     biomeBushes.forEach(b => {
-        b.visible = camera.position.distanceTo(b.position) < maxDist && !b.userData.harvested;
+        b.visible = camera.position.distanceTo(b.position) < maxDist;
     });
 
     crystals.forEach(c => {
@@ -1095,6 +1150,8 @@ function createBush(biome) {
     bushBase.scale.y = 0.7;
     bush.add(bushBase);
 
+    const berryMeshes = [];
+
     for(let i=0;i<8;i++){
         const berry = new THREE.Mesh(
             new THREE.SphereGeometry(0.08, 6, 6),
@@ -1105,12 +1162,16 @@ function createBush(biome) {
             Math.random()*0.5,
             (Math.random()-0.5)*1.1
         );
+        berry.userData.isBerry = true;
+        berry.userData.berryType = berryType;
+        berry.userData.parentBush = bush;
+        berryMeshes.push(berry);
         bush.add(berry);
     }
 
     bush.userData = {
         berryType: berryType,
-        harvested: false
+        berryMeshes: berryMeshes
     };
 
     return bush;
@@ -1173,6 +1234,7 @@ for(let cx=-4; cx<=4; cx++) {
             const tx = cx*120 + (Math.random()-0.5)*110;
             const tz = cz*120 + (Math.random()-0.5)*110;
             const ty = getTerrainHeight(tx, tz);
+            if (Math.hypot(tx, tz) < 6) continue;
 
             const tree = createBiomeTree(biome);
             tree.position.set(tx, ty - TREE_GROUND_OFFSET, tz);
@@ -1323,32 +1385,45 @@ function updateDayNightCycle() {
     }
 }
 
-function collectNearbyBerries() {
-    for(let i=0;i<biomeBushes.length;i++) {
+function pickBerryFromBush() {
+    if (currentDimension !== "surface") return;
 
+    const viewDir = new THREE.Vector3();
+    camera.getWorldDirection(viewDir);
+    raycaster.set(camera.position, viewDir);
+
+    const berryObjects = [];
+    for (let i = 0; i < biomeBushes.length; i++) {
         const bush = biomeBushes[i];
+        if (!bush.visible || !bush.userData.berryMeshes) continue;
 
-        if (bush.userData.harvested) continue;
-
-        if(camera.position.distanceTo(bush.position) < 2.5) {
-
-            bush.userData.harvested = true;
-
-            const berryType = bush.userData.berryType;
-            berryInventory[berryType] += 3;
-
-            bush.visible = false;
-
-            updateInventoryPanel();
-
-            setTimeout(() => {
-                bush.visible = true;
-                bush.userData.harvested = false;
-            }, 60000);
-
-            break;
-        }
+        bush.userData.berryMeshes.forEach(berry => {
+            if (berry.visible) berryObjects.push(berry);
+        });
     }
+
+    const hits = raycaster.intersectObjects(berryObjects, false);
+
+    if (hits.length === 0 || hits[0].distance > 5) {
+        return;
+    }
+
+    const berry = hits[0].object;
+    const berryType = berry.userData.berryType || "red";
+
+    berry.visible = false;
+    berryInventory[berryType] += 1;
+    updateInventoryPanel();
+
+    // A bokor megmarad, csak ez az egy bogyó nő vissza később.
+    setTimeout(() => {
+        berry.visible = true;
+    }, 60000);
+}
+
+function collectNearbyBerries() {
+    // Régen automatikusan felszedte a bokrot, ha beleléptél.
+    // Most direkt üres: bogyót csak jobb klikkel lehet leszedni.
 }
 
 
