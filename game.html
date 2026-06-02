@@ -91,6 +91,46 @@
         .scared { animation: camShake 0.05s infinite; }
         
         #location-display { font-weight: bold; color: #ff00ff; margin-bottom: 5px; text-align: center; background: rgba(255,255,255,0.1); padding: 5px; border-radius: 3px; }
+
+        /* --- MULTIPLAYER CHAT --- */
+        #chat-panel {
+            display: none;
+            position: fixed;
+            left: 20px;
+            bottom: 20px;
+            width: 340px;
+            background: rgba(0, 0, 0, 0.85);
+            color: white;
+            border: 2px solid #00ffff;
+            border-radius: 6px;
+            padding: 10px;
+            z-index: 500;
+            font-family: monospace;
+        }
+        #chat-title {
+            color: #00ffff;
+            font-weight: bold;
+            margin-bottom: 6px;
+        }
+        #chat-messages {
+            height: 150px;
+            overflow-y: auto;
+            background: rgba(255,255,255,0.06);
+            padding: 6px;
+            margin-bottom: 6px;
+            font-size: 13px;
+            border: 1px solid #333;
+        }
+        #chat-input {
+            width: 245px;
+            box-sizing: border-box;
+        }
+        #chat-send-btn {
+            width: 75px;
+        }
+        .chat-system { color: #aaa; }
+        .chat-me { color: #00ff99; }
+        .chat-friend { color: #ff66ff; }
     </style>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
     <script src="https://unpkg.com/peerjs@1.4.7/dist/peerjs.min.js"></script>
@@ -144,7 +184,18 @@
     <b>B gomb:</b> Építés KI / BE<br>
     <b>Bal Klikk:</b> Használat / Építés<br>
     <b>Jobb Klikk:</b> Bogyó leszedése bokorról<br>
+    <b>Z gomb:</b> Chat megnyitása / bezárása<br>
     <b>0 gomb:</b> UI elrejtése
+</div>
+
+
+<div id="chat-panel">
+    <div id="chat-title">💬 CHAT - Z bezárás/megnyitás</div>
+    <div id="chat-messages">
+        <div class="chat-system">Chat készen áll. Csatlakozz egy baráthoz, majd írj üzenetet.</div>
+    </div>
+    <input type="text" id="chat-input" placeholder="Üzenet...">
+    <button id="chat-send-btn">Küldés</button>
 </div>
 
 <script>
@@ -279,6 +330,9 @@ function setupConnection() {
                 triggerJumpscareEffect();
             }
         }
+        if (data.type === 'chat_message') {
+            addChatMessage(remotePlayerName || 'Barát', data.message, 'friend');
+        }
     });
 }
 
@@ -306,6 +360,66 @@ document.getElementById('jumpscare-btn').addEventListener('click', () => {
         alert("Nincs csatlakozva senki, akit jumpscare-elhetnél!");
     }
 });
+
+
+// --- MULTIPLAYER CHAT ---
+let chatOpen = false;
+
+function addChatMessage(sender, message, type = "system") {
+    const messages = document.getElementById('chat-messages');
+    if (!messages) return;
+
+    const line = document.createElement('div');
+    line.className = type === "me" ? "chat-me" : (type === "friend" ? "chat-friend" : "chat-system");
+    line.textContent = sender + ": " + message;
+
+    messages.appendChild(line);
+    messages.scrollTop = messages.scrollHeight;
+}
+
+function toggleChat() {
+    const panel = document.getElementById('chat-panel');
+    const input = document.getElementById('chat-input');
+    chatOpen = !chatOpen;
+
+    panel.style.display = chatOpen ? 'block' : 'none';
+
+    if (chatOpen) {
+        if (document.pointerLockElement === document.body) {
+            document.exitPointerLock();
+        }
+        setTimeout(() => input.focus(), 50);
+    } else {
+        input.blur();
+    }
+}
+
+function sendChatMessage() {
+    const input = document.getElementById('chat-input');
+    const msg = input.value.trim();
+    if (!msg) return;
+
+    addChatMessage(myPlayerName || 'Én', msg, 'me');
+
+    if (conn && conn.open) {
+        conn.send({ type: 'chat_message', message: msg });
+    } else {
+        addChatMessage('Rendszer', 'Nincs csatlakozva senkihez, ezért csak te látod ezt.', 'system');
+    }
+
+    input.value = '';
+}
+
+document.getElementById('chat-send-btn').addEventListener('click', sendChatMessage);
+document.getElementById('chat-input').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+        sendChatMessage();
+    }
+    if (e.key === 'Escape') {
+        toggleChat();
+    }
+});
+
 
 // --- CRAFTING INTERAKCIÓK ---
 document.getElementById('craft-stick-btn').addEventListener('click', () => {
@@ -728,6 +842,8 @@ function damageCrystalById(id) {
 
 // Utoljára használt barlang koordinátája (visszatéréshez)
 let lastEnteredCavePos = new THREE.Vector3(0, 0, 0);
+let lastEnteredPortalRadius = 4.5;
+let caveExitCooldownUntil = 0;
 
 function useCurrentTool() {
     if (isToolSwinging) return;
@@ -793,6 +909,12 @@ const keys = {};
 let uiVisible = true;
 window.addEventListener('keydown', (e) => { 
     if (document.activeElement.tagName === 'INPUT') return; 
+
+    if (e.key.toLowerCase() === 'z') {
+        toggleChat();
+        return;
+    }
+
     keys[e.key.toLowerCase()] = true; 
     if (e.key === '0') {
         uiVisible = !uiVisible;
@@ -937,13 +1059,20 @@ function updateMovement() {
         // ELLENŐRZÉS: Közel vagyunk-e a ritkán elszórt barlangok valamelyikéhez?
         for(let i=0; i < cavePortals.length; i++) {
             const portalRadius = cavePortals[i].radius || 4.5;
+
+            // Kijövetel után rövid ideig ne szívjon vissza ugyanaz a portál.
+            if (performance.now() < caveExitCooldownUntil) continue;
+
             if (distanceXZ(camera.position, cavePortals[i].position) < portalRadius) {
                 lastEnteredCavePos.copy(cavePortals[i].position); // Elmentjük ahonnan jöttünk
+                lastEnteredPortalRadius = portalRadius;
                 currentDimension = "cave";
                 surfaceGroup.visible = false;
                 caveGroup.visible = true;
                 scene.background.setHex(0x0c0c10);
-                camera.position.set(0, 1.8, 4); 
+
+                // Nem közvetlenül a kijárat mellé rakjuk, hogy ne dobjon vissza azonnal.
+                camera.position.set(0, 1.8, 6); 
                 document.getElementById('location-display').innerText = "🔮 KRISTÁLYBARLANG";
                 document.getElementById('location-display').style.color = "#00ffff";
                 sendMovementData(true);
@@ -959,8 +1088,13 @@ function updateMovement() {
             caveGroup.visible = false;
             scene.background.setHex(0x4a75a0);
             
-            // Pontosan ahhoz a barlangbejárathoz rak vissza, amelyiken bementél (csak kicsit elé)
-            camera.position.set(lastEnteredCavePos.x, getTerrainHeight(lastEnteredCavePos.x, lastEnteredCavePos.z + 3) + 1.8, lastEnteredCavePos.z + 3);
+            // Pontosan ahhoz a barlangbejárathoz rak vissza, amelyiken bementél,
+            // de elég messzire tőle, hogy ne teleportáljon azonnal vissza.
+            const exitOffset = lastEnteredPortalRadius + 7;
+            const exitX = lastEnteredCavePos.x;
+            const exitZ = lastEnteredCavePos.z + exitOffset;
+            camera.position.set(exitX, getTerrainHeight(exitX, exitZ) + 1.8, exitZ);
+            caveExitCooldownUntil = performance.now() + 2500;
             document.getElementById('location-display').innerText = "📍 FELSZÍN";
             document.getElementById('location-display').style.color = "#ff00ff";
             sendMovementData(true);
