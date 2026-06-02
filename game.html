@@ -176,6 +176,32 @@ function getTerrainHeight(x, z) {
     return height;
 }
 
+// Biztonságos barlangpozíció keresése: ne vízbe kerüljön a bejárat
+function findSafeCavePosition(x, z) {
+    const originalY = getTerrainHeight(x, z);
+    if (originalY > -0.5) {
+        return { x: x, y: originalY, z: z };
+    }
+
+    for (let radius = 5; radius <= 80; radius += 5) {
+        for (let angle = 0; angle < Math.PI * 2; angle += Math.PI / 8) {
+            const nx = x + Math.cos(angle) * radius;
+            const nz = z + Math.sin(angle) * radius;
+            const ny = getTerrainHeight(nx, nz);
+
+            if (ny > -0.5) {
+                return { x: nx, y: ny, z: nz };
+            }
+        }
+    }
+
+    return { x: x, y: Math.max(originalY, 0), z: z };
+}
+
+function distanceXZ(a, b) {
+    return Math.hypot(a.x - b.x, a.z - b.z);
+}
+
 function createRemotePlayer() {
     const geo = new THREE.SphereGeometry(0.4, 32, 32);
     const mat = new THREE.MeshStandardMaterial({ color: 0xff00ff, roughness: 0.2, emissive: 0xff00ff, emissiveIntensity: 0.3 });
@@ -478,15 +504,16 @@ for(let c = 0; c < totalCavesNum; c++) {
     light.position.set(0, 1.4, 0.5);
     singleCaveGroup.add(light);
     
-    // Dombmagasság lekérése és pozicionálás
-    let terrainH = getTerrainHeight(cp.x, cp.z);
-    singleCaveGroup.position.set(cp.x, terrainH, cp.z);
+    // Biztonságos száraz hely keresése és pozicionálás
+    let safePos = findSafeCavePosition(cp.x, cp.z);
+    singleCaveGroup.position.set(safePos.x, safePos.y, safePos.z);
     surfaceGroup.add(singleCaveGroup);
     
     // Eltároljuk a triggert az ellenőrzéshez
     cavePortals.push({
-        position: new THREE.Vector3(cp.x, terrainH, cp.z),
-        trigger: portalTriggerMesh
+        position: new THREE.Vector3(safePos.x, safePos.y, safePos.z),
+        trigger: portalTriggerMesh,
+        radius: 4.5
     });
 }
 
@@ -562,6 +589,7 @@ scene.add(camera);
 const trees = [];
 const maxTrees = 40;
 const spawnRadius = 80;
+const TREE_GROUND_OFFSET = 0.45; // Ennyivel süllyesztjük a fákat, hogy ne lebegjenek dombokon sem
 
 function createTreeMesh() {
     const treeGroup = new THREE.Group();
@@ -589,7 +617,7 @@ while (spawnedTrees < maxTrees) {
     
     if (ry > -1.1) {
         const treeMesh = createTreeMesh();
-        treeMesh.position.set(rx, ry, rz);
+        treeMesh.position.set(rx, ry - TREE_GROUND_OFFSET, rz);
         surfaceGroup.add(treeMesh);
         trees.push({ id: spawnedTrees, mesh: treeMesh, health: 3 });
         spawnedTrees++;
@@ -788,34 +816,39 @@ function checkCollision(targetX, targetZ) {
         if (Math.abs(localX) < (wallLength / 2 + playerRadius) && Math.abs(localZ) < (wallWidth / 2 + playerRadius)) return true; 
     }
     
-    // Fákkal ütközés
-    const treeRadius = 1.8;
-    for (let i = 0; i < trees.length; i++) {
-        const p = trees[i].mesh.position;
-        if (Math.hypot(targetX - p.x, targetZ - p.z) < treeRadius) return true;
-    }
-
-    if (typeof surfaceGroup !== 'undefined') {
-        surfaceGroup.children.forEach(obj => {
-            if (obj.type === 'Group' && obj !== blueprint) {
-                const p = obj.position;
-                if (Math.hypot(targetX - p.x, targetZ - p.z) < treeRadius) {
-                    if (obj.children.length > 0) {
-                        return true;
-                    }
-                }
-            }
-        });
+    // Fákkal ütközés: minden fa, ami a trees listában van, hitboxot kap.
+    // A kivágott fákon át lehet menni.
+    if (currentDimension === "surface") {
+        const treeRadius = 1.6;
+        for (let i = 0; i < trees.length; i++) {
+            const tree = trees[i];
+            if (!tree.mesh.visible || tree.health <= 0) continue;
+            const p = tree.mesh.position;
+            if (Math.hypot(targetX - p.x, targetZ - p.z) < treeRadius) return true;
+        }
     }
 
     return false; 
 }
 
 let lastSentPosition = new THREE.Vector3();
-function sendMovementData() {
+let lastNetworkSendTime = 0;
+const NETWORK_SEND_INTERVAL = 80; // kb. 12.5 küldés / másodperc, kevesebb lag multiplayerben
+
+function sendMovementData(force = false) {
     if (conn && conn.open) {
-        conn.send({ type: 'move', x: camera.position.x, y: camera.position.y, z: camera.position.z, dim: currentDimension });
+        const now = performance.now();
+        if (!force && now - lastNetworkSendTime < NETWORK_SEND_INTERVAL) return;
+
+        conn.send({
+            type: 'move',
+            x: camera.position.x,
+            y: camera.position.y,
+            z: camera.position.z,
+            dim: currentDimension
+        });
         lastSentPosition.copy(camera.position);
+        lastNetworkSendTime = now;
     }
 }
 
@@ -847,7 +880,8 @@ function updateMovement() {
         
         // ELLENŐRZÉS: Közel vagyunk-e a ritkán elszórt barlangok valamelyikéhez?
         for(let i=0; i < cavePortals.length; i++) {
-            if (camera.position.distanceTo(cavePortals[i].position) < 2.2) {
+            const portalRadius = cavePortals[i].radius || 4.5;
+            if (distanceXZ(camera.position, cavePortals[i].position) < portalRadius) {
                 lastEnteredCavePos.copy(cavePortals[i].position); // Elmentjük ahonnan jöttünk
                 currentDimension = "cave";
                 surfaceGroup.visible = false;
@@ -856,7 +890,7 @@ function updateMovement() {
                 camera.position.set(0, 1.8, 4); 
                 document.getElementById('location-display').innerText = "🔮 KRISTÁLYBARLANG";
                 document.getElementById('location-display').style.color = "#00ffff";
-                sendMovementData();
+                sendMovementData(true);
                 break;
             }
         }
@@ -873,11 +907,11 @@ function updateMovement() {
             camera.position.set(lastEnteredCavePos.x, getTerrainHeight(lastEnteredCavePos.x, lastEnteredCavePos.z + 3) + 1.8, lastEnteredCavePos.z + 3);
             document.getElementById('location-display').innerText = "📍 FELSZÍN";
             document.getElementById('location-display').style.color = "#ff00ff";
-            sendMovementData();
+            sendMovementData(true);
         }
     }
 
-    if (camera.position.distanceToSquared(lastSentPosition) > 0.0001) sendMovementData();
+    if (camera.position.distanceToSquared(lastSentPosition) > 0.01) sendMovementData();
 }
 
 function updateNametag() {
@@ -1141,8 +1175,12 @@ for(let cx=-4; cx<=4; cx++) {
             const ty = getTerrainHeight(tx, tz);
 
             const tree = createBiomeTree(biome);
-            tree.position.set(tx, ty, tz);
+            tree.position.set(tx, ty - TREE_GROUND_OFFSET, tz);
             surfaceGroup.add(tree);
+
+            // Fontos: a biome-fák is bekerülnek a trees listába,
+            // így van hitboxuk és baltával ki lehet őket vágni.
+            trees.push({ id: trees.length, mesh: tree, health: 3 });
         }
 
         const bushCount = biome === "forest" ? 5 : 2;
@@ -1181,14 +1219,15 @@ for(let i=1;i<=6;i++) {
     portal.position.y = 5;
     megaCave.add(portal);
 
-    const terrainY = getTerrainHeight(caveX, caveZ);
+    const safeMegaPos = findSafeCavePosition(caveX, caveZ);
 
-    megaCave.position.set(caveX, terrainY, caveZ);
+    megaCave.position.set(safeMegaPos.x, safeMegaPos.y, safeMegaPos.z);
     surfaceGroup.add(megaCave);
 
     cavePortals.push({
-        position: new THREE.Vector3(caveX, terrainY, caveZ),
-        trigger: portal
+        position: new THREE.Vector3(safeMegaPos.x, safeMegaPos.y, safeMegaPos.z),
+        trigger: portal,
+        radius: 8.0
     });
 }
 
